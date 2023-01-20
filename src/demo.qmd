@@ -1,0 +1,176 @@
+---
+title: "DynLoco demo"
+format: 
+     html:
+          code-fold: true
+jupyter: julia-1.8
+---
+## Perform short walks of a range of distances
+Take walks of varying distances, and show how the optimal trajectory has an inverted-U 
+velocity profile, with peak speed that increases with distance up to about 12 steps.
+The cost function is total work, plus a linear cost of time with coefficient ctime.
+
+```{julia}
+#| fig-cap: "Short walks of varying distance"
+
+using DynLoco, Plots; plotlyjs()
+
+wstar4 = findgait(WalkRW2l(α=0.35,safety=true), target=:speed=>0.3, varying=:P)
+ctime = 0.015 # cost of time, to encourage hurrying
+tchange = 1.75 # boundary condition time to get up to speed (arbitrary, excluded from optimization) 
+p = plot() 
+walksteps = [1, 2, 3, 4, 5, 6, 7, 10, 15, 20] # take walks of this # of steps
+results = Array{MultiStepResults,1}(undef,0) # store each optimization result here
+for (i,nsteps) in enumerate(walksteps)
+    result = optwalktime(wstar4, nsteps, ctime=ctime) # optimize with a cost of time
+    plotvees!(result, tchange=tchange, usespline=false, color=i, speedtype=:shortwalks, rampuporder=1, markersize=2) # plot instantaneous body speed vs. time
+    push!(results, result) # add this optimization to results array
+end
+Plots.display(p) # instantaneous speed vs. distance profiles
+```
+## Compare three objectives: Energy-Time, min-COT, constant accel
+Walk a fixed number of steps, starting and ending at rest. The
+objectives are:
+
+* **Energy-Time** minimizes total energy (positive work) plus proportional time cost
+* **min-COT** minimizes cost of transport (energy per weight and distance traveled)
+* **Constant accel** accelerates at a constant rate, to yield a triangular speed profile. Uses a minimum variance objective to 
+produce a constant rate of velocity change.
+
+Compare for a fixed number of steps.
+```{julia}
+## Triangle walk, based on min var walk
+wstar4s = findgait(WalkRW2l(α=0.35,safety=true), target=:speed=>0.5, varying=:P)
+wstar4n = findgait(WalkRW2l(α=0.35, safety=true), target=:speed=>0.4, varying=:P)
+nsteps = 10
+ctime = 0.0195
+tchange = 1.75
+nominalmsr=optwalktime(wstar4n, nsteps, ctime = ctime, boundarywork=true) # to compare with our usual solution
+minvarmsr=optwalkvar(wstar4n, nsteps, boundarywork=true)
+A = 1.9*wstar4s.vm/(nsteps*onestep(wstar4s).tf)
+v0 = 0.11#0.8*A*tchange#0.12
+mintrimsr=optwalktriangle(wstar4n, nsteps, A = A, boundarywork=false,boundaryvels=(v0,v0))
+p = plot(layout=(1,2))
+plotvees!(p[1],nominalmsr, tchange=tchange, rampuporder=1, usespline = false, markershape=:circle,speedtype=:shortwalks)
+plotvees!(p[1],minvarmsr, tchange=tchange, rampuporder=1, usespline = false,markershape=:circle, speedtype=:shortwalks)
+plotvees!(p[1],mintrimsr, tchange=tchange, rampuporder=1, usespline = false,markershape=:circle, speedtype=:shortwalks, seriescolor=:auto)
+plot!(p[2],[0:nsteps+1], [1/2*nominalmsr.vm0^2; nominalmsr.steps.Pwork; NaN],markershape=:circle,seriescolor=:auto)
+plot!(p[2],[0:nsteps+1], [1/2*minvarmsr.vm0^2; minvarmsr.steps.Pwork; NaN],markershape=:circle,xticks=0:nsteps+1)
+plot!(p[2],[0:nsteps+1], [1/2*mintrimsr.vm0^2; mintrimsr.steps.Pwork; NaN],markershape=:circle,xticks=0:nsteps+1,seriescolor=:auto)
+plot!(p[2],xlabel="step", ylabel="push-off work", legend=false)
+energytimework = 1/2*nominalmsr.vm0^2 + sum(nominalmsr.steps.Pwork)
+mincotwork = 1/2*minvarmsr.vm0^2 + sum(minvarmsr.steps.Pwork)
+trianglework = (1/2*mintrimsr.vm0^2 + sum(mintrimsr.steps.Pwork))/(1/2*nominalmsr.vm0^2 + sum(nominalmsr.steps.Pwork))
+Plots.display(p)
+```
+Quantify the three predictions.
+```{julia}
+using Markdown
+println("energy-time work = ", 1/2*nominalmsr.vm0^2 + sum(nominalmsr.steps.Pwork))
+println("min-COT = ", 1/2*minvarmsr.vm0^2 + sum(minvarmsr.steps.Pwork))
+println("triangle   = ", 1/2*mintrimsr.vm0^2 + sum(mintrimsr.steps.Pwork))
+println("ratio = ",  (1/2*minvarmsr.vm0^2 + sum(minvarmsr.steps.Pwork))/(1/2*nominalmsr.vm0^2 + sum(nominalmsr.steps.Pwork)) )
+println("ratio = ",  (1/2*mintrimsr.vm0^2 + sum(mintrimsr.steps.Pwork))/(1/2*nominalmsr.vm0^2 + sum(nominalmsr.steps.Pwork)) )
+#println("ratio = ",  (sum(minvarmsr.steps.Pwork))/(sum(nominalmsr.steps.Pwork)) )
+
+threecosts = [1/2*nominalmsr.vm0^2 + sum(nominalmsr.steps.Pwork), 1/2*minvarmsr.vm0^2 + sum(minvarmsr.steps.Pwork), 1/2*mintrimsr.vm0^2 + sum(mintrimsr.steps.Pwork)]
+bar(threecosts,xticks=((1,2,3),("Energy-Time", "Steady min-COT", "Steady accel")),legend=false)
+```
+
+```{julia}
+using Markdown
+Markdown.parse("""
+The energy-time work is $(threecosts[1]). 
+The min-COT work is $(threecosts[2]).
+The const accel work is $(threecosts[3]).
+""")
+```
+
+## Brachistokuo ramp
+Optimal slope and walk with ramp, compared with flat walking in same amount of time.
+We find six steps to be pretty good. Longer walks yield a smaller differene because there's more time spent at a steady speed. 
+Note: Currently solving for an asymmetric ramp profile, because pure symmetry constraint is slightly overconstrained for latest Ipopt.
+```{julia}
+wstar = findgait(WalkRW2l(α=0.35,safety=true), target=:speed=>0.4, varying=:P)
+N = 6
+walktime = N * onestep(wstar).tf *0.82 # meant to be a brisk walk
+walkdistance = N * onestep(wstar).steplength
+rampresult = optwalkslope(wstar, N, boundaryvels = (0., 0.), symmetric = false,
+    totaltime = walktime)
+p = multistepplot(rampresult; plotwork=true, label="ramp")
+println("ramp total cost = ", rampresult.totalcost)
+flatresult = optwalk(wstar, N, boundaryvels = (0., 0.),
+    totaltime = rampresult.totaltime, δs = zeros(6))
+println("flat total cost = ", flatresult.totalcost)
+multistepplot!(flatresult; plotwork=true, label="flat")
+# optionally, try a reversed ramp and see if it's higher cost still
+#concaveresult = optwalk(wstar, 6, boundaryvels = (0.,0.), boundarywork=true,
+#    totaltime = rampresult.totaltime, δ = -rampresult.δangles)
+#multistepplot!(concaveresult; plotwork=true)
+```
+### Brachistokuo ramp: Compute the cost for different speeds
+```{julia}
+walktimes = (0.8:0.05:1.2) * N*onestep(wstar).tf
+rampresults = Array{MultiStepResults,1}(undef, length(walktimes))
+flatresults = Array{MultiStepResults,1}(undef, length(walktimes))
+for (i,walktime) in enumerate(walktimes)
+    rampresults[i] = optwalk(wstar, N, boundaryvels = (0.,0.),
+        totaltime = walktime, δs = rampresult.δangles)
+    flatresults[i] = optwalk(wstar, N, boundaryvels = (0.,0.),
+        totaltime = walktime, δs = zeros(N))
+end
+# plot totalcost vs average speed
+plot(walkdistance ./ walktimes, [getfield.(rampresults, :totalcost), getfield.(flatresults, :totalcost)],
+    xlabel="Average speed", ylabel="Total Work", labels=["Ramp" "Flat"])
+```
+
+### Plot the ramp to scale
+```{julia}
+plot(onestep(wstar).steplength .* (0:6),cumsum(tan.([0;rampresult.δangles]).*onestep(wstar).steplength),
+    aspect_ratio=1)
+sl = onestep(wstar).steplength
+plot(sl .* [0; cumsum(cos.(rampresult.δangles))],[0; cumsum(sin.(rampresult.δangles))].*sl,
+    aspect_ratio=1)
+```
+
+## Short walks of varying slope
+To be compared with Emily's data
+```{julia}
+wstar4s = findgait(WalkRW2l(α=0.4,safety=true), target=:speed=>0.4, varying=:P)
+myslopes = 0:0.02:0.08
+p = plot(layout=(2,1))
+nsteps = 6
+startv = wstar4.vm
+for slope in myslopes
+    # walk up a slope
+    resultup = optwalktime(wstar4s, nsteps, ctime = ctime, δs=fill(slope, nsteps));
+    plotvees!(p[1],resultup, tchange=1, title="Up", rampuporder=1)
+    startv = [resultup.vm0;resultup.steps.vm]
+
+    # Walk down a slope
+    resultdown = optwalktime(wstar4s, nsteps, ctime = ctime, δs=fill(-slope, nsteps));
+    plotvees!(p[2],resultdown, tchange=1, title="Down", rampuporder=1)
+end
+Plots.display(p)
+```
+
+
+## Todo: Uneven terrain
+1. Plot uneven terrain profile
+2. Draw a stick figure model (see Matlab walkrw2 animation)
+3. Generate automatic superposition figure
+
+## Todo: Short walks
+1. Analyze ramp data (from Emily)
+2. Analyze different speed data 
+
+## Step-to-step transitions and energy cost
+1. Metabolic power for preferred walking
+2. Inverse dynamics grid data for COM power, work
+3. Edot = v^3.42 plot
+
+## Todo: Mechanics story
+1. Some nice figures to show energy-time-slope tradeoff
+2. Step-to-step transition through prediction
+
+## Todo: Photos & video of brachistokuo
